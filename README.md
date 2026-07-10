@@ -49,11 +49,12 @@ python -m boss_mcp_job_hunting.server
 
 ### `login_boss_interactive`
 
-打开可见浏览器窗口，等待扫码登录和安全验证完成。它会处理 Boss 安全验证后跳到 `about:blank` 的情况，并反复探测职位搜索页是否可访问。
+打开可见浏览器窗口，等待扫码登录和安全验证完成。默认会先给你 90 秒扫码时间，这段时间不会访问岗位搜索页，避免 Boss 在你扫码前就把页面跳到 `about:blank`。如果登录页变成 `about:blank`，工具会自动重开登录页。
 
 ```json
 {
   "timeout_seconds": 300,
+  "qr_wait_seconds": 90,
   "check_interval_seconds": 5
 }
 ```

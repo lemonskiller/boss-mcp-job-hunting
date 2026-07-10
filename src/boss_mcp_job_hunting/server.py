@@ -201,18 +201,6 @@ def _is_recent(publish_date: str | None, days: int) -> bool:
     return parsed >= date.today() - timedelta(days=days)
 
 
-# Script injected before any page loads to hide the most obvious automation
-# fingerprints. Boss's anti-bot check (verify.html code=35 -> 403.html code=31)
-# keys off navigator.webdriver and missing chrome runtime, so masking these lets
-# a genuine human QR-login succeed instead of being blocked as a crawler.
-_STEALTH_INIT_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-window.chrome = window.chrome || {runtime: {}};
-Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh']});
-Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-"""
-
-
 def _chrome_channel() -> str | None:
     """Prefer the user's real Google Chrome over the bundled test Chromium.
 
@@ -232,10 +220,6 @@ async def _launch_context(headless: bool) -> BrowserContext:
         "headless": headless,
         "viewport": {"width": 1440, "height": 1000},
         "locale": "zh-CN",
-        "args": [
-            "--disable-blink-features=AutomationControlled",
-            "--disable-features=IsolateOrigins,site-per-process",
-        ],
     }
 
     channel = _chrome_channel()
@@ -251,7 +235,6 @@ async def _launch_context(headless: bool) -> BrowserContext:
         # Fall back to the bundled Chromium if the requested channel is missing.
         context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
 
-    await context.add_init_script(_STEALTH_INIT_SCRIPT)
     context._boss_playwright = playwright  # type: ignore[attr-defined]
     return context
 
@@ -519,17 +502,20 @@ async def get_boss_login_status(ctx: Context, headless: bool = True) -> str:
 async def login_boss_interactive(
     ctx: Context,
     timeout_seconds: int = 300,
+    qr_wait_seconds: int = 90,
     check_interval_seconds: int = 5,
 ) -> str:
     """Open a visible Boss login window and wait until the session can open job search.
 
-    Boss may redirect security-check pages to about:blank. This tool handles that
-    by reopening the login/search page in the same persistent profile and probing
-    whether the job-search page is accessible before returning.
+    The tool first gives the user a quiet QR-login window. During that grace
+    period it does not probe the job-search URL, because Boss may redirect the
+    whole session to about:blank if the probe starts before the user scans.
     """
 
     if timeout_seconds < 30 or timeout_seconds > 900:
         raise ValueError("timeout_seconds must be between 30 and 900")
+    if qr_wait_seconds < 10 or qr_wait_seconds > timeout_seconds:
+        raise ValueError("qr_wait_seconds must be between 10 and timeout_seconds")
     if check_interval_seconds < 2 or check_interval_seconds > 30:
         raise ValueError("check_interval_seconds must be between 2 and 30")
 
@@ -540,16 +526,30 @@ async def login_boss_interactive(
         page = await context.new_page()
         await _goto(page, BOSS_LOGIN_URL)
 
-        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout_seconds
+        quiet_login_deadline = loop.time() + qr_wait_seconds
         last_status: dict[str, Any] | None = None
 
-        while asyncio.get_running_loop().time() < deadline:
+        while loop.time() < deadline:
             if page.is_closed() or _looks_blank(page.url):
                 page = await context.new_page()
-                await _goto(page, BOSS_JOB_SEARCH_URL)
+                await _goto(page, BOSS_LOGIN_URL)
 
-            if _looks_like_login_page(page.url):
-                await ctx.info("Waiting for Boss QR login or verification...")
+            cookies = await context.cookies("https://www.zhipin.com")
+            cookie_names = sorted(cookie["name"] for cookie in cookies)
+            has_login_cookie = _has_login_cookie(cookie_names)
+
+            if loop.time() < quiet_login_deadline and not has_login_cookie:
+                remaining = int(quiet_login_deadline - loop.time())
+                await ctx.info(f"Waiting for Boss QR login before probing... {remaining}s left")
+                await page.wait_for_timeout(check_interval_seconds * 1000)
+                continue
+
+            if has_login_cookie:
+                await ctx.info("Login cookie detected; probing job search...")
+            elif _looks_like_login_page(page.url):
+                await ctx.info("QR wait elapsed; probing Boss login status...")
             else:
                 await ctx.info("Boss page is no longer on the login URL; probing job search...")
 
@@ -575,6 +575,7 @@ async def login_boss_interactive(
                 "message": "Timed out before Boss job search became accessible. If browser login keeps failing, use import_boss_cookies with cookies copied from a normal browser session.",
                 "applied_env_cookies": applied_env_cookies,
                 "profile_dir": _profile_display(),
+                "qr_wait_seconds": qr_wait_seconds,
                 "last_status": last_status,
             },
             ensure_ascii=False,
