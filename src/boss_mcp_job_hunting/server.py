@@ -195,6 +195,10 @@ async def _goto(page: Page, url: str) -> None:
         pass
 
 
+def _looks_like_login_page(url: str) -> bool:
+    return "/web/user/" in url or "passport" in url or "login" in url
+
+
 async def _scroll_job_list(page: Page) -> None:
     for _ in range(4):
         await page.mouse.wheel(0, 1600)
@@ -322,7 +326,7 @@ async def open_boss_login(ctx: Context, headless: bool = False) -> str:
 
     await ctx.info("Opening Boss Zhipin login page...")
     context = await _launch_context(headless=headless)
-    page = context.pages[0] if context.pages else await context.new_page()
+    page = await context.new_page()
     await _goto(page, BOSS_LOGIN_URL)
 
     return json.dumps(
@@ -344,11 +348,11 @@ async def get_boss_login_status(ctx: Context, headless: bool = True) -> str:
     await ctx.info("Checking Boss login status...")
     context = await _launch_context(headless=headless)
     try:
-        page = context.pages[0] if context.pages else await context.new_page()
-        await _goto(page, BOSS_HOME_URL)
+        page = await context.new_page()
+        await _goto(page, BOSS_JOB_SEARCH_URL)
         cookies = await context.cookies("https://www.zhipin.com")
         cookie_names = sorted(cookie["name"] for cookie in cookies)
-        likely_logged_in = any(name in cookie_names for name in ["wt2", "__zp_stoken__", "boss_login_mode"])
+        likely_logged_in = not _looks_like_login_page(page.url)
         return json.dumps(
             {
                 "likely_logged_in": likely_logged_in,
@@ -401,8 +405,20 @@ async def search_boss_jobs(
 
     context = await _launch_context(headless=headless)
     try:
-        page = context.pages[0] if context.pages else await context.new_page()
+        page = await context.new_page()
         await _goto(page, search_url)
+
+        if _looks_like_login_page(page.url):
+            return json.dumps(
+                {
+                    "status": "login_required",
+                    "message": "Boss Zhipin redirected to the login page. Run open_boss_login(headless=false), finish QR login, then search again.",
+                    "current_url": page.url,
+                    "source_url": search_url,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
 
         collected: list[JobPosting] = []
         for page_number in range(1, pages + 1):
@@ -449,4 +465,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
