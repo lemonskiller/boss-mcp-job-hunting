@@ -10,7 +10,7 @@
 ## 安装
 
 ```bash
-cd ~/Documents/boss-mcp-job-hunting
+cd boss-mcp-job-hunting
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -37,7 +37,7 @@ python -m boss_mcp_job_hunting.server
 {
   "mcpServers": {
     "boss-mcp-job-hunting": {
-      "command": "/Users/yangzhiyu/Documents/boss-mcp-job-hunting/.venv/bin/boss-mcp-job-hunting",
+      "command": "/absolute/path/to/boss-mcp-job-hunting/.venv/bin/boss-mcp-job-hunting",
       "args": []
     }
   }
@@ -59,7 +59,7 @@ python -m boss_mcp_job_hunting.server
 扫码登录后，登录态会保存在：
 
 ```text
-~/Documents/boss-mcp-job-hunting/.boss-browser-profile
+./.boss-browser-profile
 ```
 
 ### `get_boss_login_status`
@@ -95,4 +95,3 @@ Boss 直聘页面和风控策略可能变化。如果搜索结果为空，通常
 1. 调用 `open_boss_login(headless=false)` 完成登录或安全验证。
 2. 把 `headless` 改为 `false` 观察浏览器页面。
 3. 减少 `pages`，避免过于频繁访问。
-
