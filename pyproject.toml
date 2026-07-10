@@ -1,0 +1,22 @@
+[project]
+name = "boss-mcp-job-hunting"
+version = "0.1.0"
+description = "A FastMCP server for searching Boss Zhipin jobs during job hunting."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.13.0",
+    "playwright>=1.40.0",
+]
+
+[project.scripts]
+boss-mcp-job-hunting = "boss_mcp_job_hunting.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
