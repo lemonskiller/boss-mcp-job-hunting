@@ -201,18 +201,57 @@ def _is_recent(publish_date: str | None, days: int) -> bool:
     return parsed >= date.today() - timedelta(days=days)
 
 
+# Script injected before any page loads to hide the most obvious automation
+# fingerprints. Boss's anti-bot check (verify.html code=35 -> 403.html code=31)
+# keys off navigator.webdriver and missing chrome runtime, so masking these lets
+# a genuine human QR-login succeed instead of being blocked as a crawler.
+_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+window.chrome = window.chrome || {runtime: {}};
+Object.defineProperty(navigator, 'languages', {get: () => ['zh-CN', 'zh']});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+"""
+
+
+def _chrome_channel() -> str | None:
+    """Prefer the user's real Google Chrome over the bundled test Chromium.
+
+    Set BOSS_MCP_BROWSER_CHANNEL=chromium to force the bundled build.
+    """
+
+    channel = os.getenv("BOSS_MCP_BROWSER_CHANNEL", "chrome").strip()
+    return channel or None
+
+
 async def _launch_context(headless: bool) -> BrowserContext:
     profile = _profile_dir()
     profile.mkdir(parents=True, exist_ok=True)
 
+    launch_kwargs: dict[str, Any] = {
+        "user_data_dir": str(profile),
+        "headless": headless,
+        "viewport": {"width": 1440, "height": 1000},
+        "locale": "zh-CN",
+        "args": [
+            "--disable-blink-features=AutomationControlled",
+            "--disable-features=IsolateOrigins,site-per-process",
+        ],
+    }
+
+    channel = _chrome_channel()
     playwright = await async_playwright().start()
-    context = await playwright.chromium.launch_persistent_context(
-        user_data_dir=str(profile),
-        headless=headless,
-        viewport={"width": 1440, "height": 1000},
-        locale="zh-CN",
-        args=["--disable-blink-features=AutomationControlled"],
-    )
+    try:
+        if channel and channel != "chromium":
+            context = await playwright.chromium.launch_persistent_context(
+                channel=channel, **launch_kwargs
+            )
+        else:
+            context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
+    except Exception:
+        # Fall back to the bundled Chromium if the requested channel is missing.
+        context = await playwright.chromium.launch_persistent_context(**launch_kwargs)
+
+    await context.add_init_script(_STEALTH_INIT_SCRIPT)
     context._boss_playwright = playwright  # type: ignore[attr-defined]
     return context
 

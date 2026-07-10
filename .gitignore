@@ -9,3 +9,5 @@ __pycache__/
 # Playwright persistent browser profile. It may contain login cookies.
 .boss-browser-profile/
 
+# Local ad-hoc debugging scripts.
+scripts/_*.py
