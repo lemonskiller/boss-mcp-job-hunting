@@ -623,6 +623,114 @@ async def _click_next_page(page: Page) -> bool:
     return False
 
 
+async def _connect_chrome_debug(debug_url: str) -> BrowserContext:
+    playwright = await async_playwright().start()
+    try:
+        browser = await playwright.chromium.connect_over_cdp(debug_url)
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        context._boss_playwright = playwright  # type: ignore[attr-defined]
+        context._boss_browser = browser  # type: ignore[attr-defined]
+        return context
+    except Exception:
+        await playwright.stop()
+        raise
+
+
+async def _close_chrome_debug_context(context: BrowserContext) -> None:
+    playwright = getattr(context, "_boss_playwright", None)
+    # Do not call browser.close() for a CDP connection: that closes the user's
+    # real Chrome. Stopping Playwright detaches our client from the debugging
+    # connection and leaves Chrome running.
+    if playwright:
+        await playwright.stop()
+
+
+def _find_existing_boss_page(context: BrowserContext) -> Page | None:
+    candidates = []
+    for page in context.pages:
+        url = page.url or ""
+        if "zhipin.com" in url and not _looks_blank(url):
+            candidates.append(page)
+    for page in candidates:
+        if "/web/geek/job" in (page.url or ""):
+            return page
+    return candidates[0] if candidates else None
+
+
+async def _extract_jobs_from_chrome_debug(
+    keyword: str,
+    city: str,
+    city_code: str | None,
+    days: int,
+    pages: int,
+    extra_keywords: list[str] | None,
+    require_publish_date: bool,
+    debug_url: str,
+    allow_navigation: bool,
+) -> dict[str, Any]:
+    terms = _keyword_terms(keyword, extra_keywords)
+    search_url = _build_search_url(keyword, city, city_code)
+    context = await _connect_chrome_debug(debug_url)
+    try:
+        page = _find_existing_boss_page(context)
+        if page is None:
+            return {
+                "status": "manual_navigation_required",
+                "message": "No existing Boss Zhipin page was found in the connected Chrome session. Open the source_url manually in that Chrome, wait for results to render, then call again.",
+                "source_url": search_url,
+            }
+
+        if "/web/geek/job" not in page.url:
+            if not allow_navigation:
+                return {
+                    "status": "manual_navigation_required",
+                    "message": "A Boss page was found, but it is not a job-search results page. Open the source_url manually in that Chrome, wait for results to render, then call again.",
+                    "current_url": page.url,
+                    "source_url": search_url,
+                }
+            await _goto(page, search_url)
+
+        if _looks_like_login_page(page.url):
+            return {
+                "status": "login_required",
+                "message": "The connected Chrome session is not on an accessible Boss job-search page.",
+                "current_url": page.url,
+                "source_url": search_url,
+            }
+
+        collected: list[JobPosting] = []
+        for page_number in range(1, pages + 1):
+            await _scroll_job_list(page)
+            collected.extend(await _extract_jobs_from_page(page, terms))
+            if page_number < pages:
+                has_next = await _click_next_page(page)
+                if not has_next:
+                    break
+
+        filtered: list[JobPosting] = []
+        for job in collected:
+            text = job.raw_text or ""
+            matches_keyword = bool(job.matched_keywords) or keyword.lower() in text.lower()
+            has_recent_date = _is_recent(job.publish_date, days)
+            if matches_keyword and (has_recent_date or (not require_publish_date and not job.publish_date)):
+                filtered.append(job)
+
+        return {
+            "status": "success",
+            "keyword": keyword,
+            "city": city,
+            "city_code": _city_code(city, city_code),
+            "days": days,
+            "source_url": search_url,
+            "current_url": page.url,
+            "total_collected": len(collected),
+            "total_matched": len(filtered),
+            "jobs": [asdict(job) for job in filtered],
+        }
+    finally:
+        await _close_chrome_debug_context(context)
+
+
 @mcp.tool()
 async def open_boss_login(
     ctx: Context,
@@ -1012,6 +1120,61 @@ async def search_boss_jobs(
         return json.dumps(response, ensure_ascii=False, indent=2)
     finally:
         await _close_context(context)
+
+
+@mcp.tool()
+async def search_boss_jobs_chrome_debug(
+    ctx: Context,
+    keyword: str,
+    city: str = "全国",
+    city_code: str | None = None,
+    days: int = 30,
+    pages: int = 3,
+    extra_keywords: list[str] | None = None,
+    require_publish_date: bool = True,
+    debug_url: str = "http://127.0.0.1:9222",
+    allow_navigation: bool = False,
+) -> str:
+    """Search Boss jobs by attaching to the user's real Chrome via CDP.
+
+    Start Chrome with remote debugging enabled, log in normally, then call this
+    tool. By default it only reads the existing Boss tab and will not navigate
+    or open pages, because Boss may blank the page when automation navigates.
+    """
+
+    if not keyword.strip():
+        raise ValueError("keyword cannot be empty")
+    if days < 1:
+        raise ValueError("days must be >= 1")
+    if pages < 1 or pages > 10:
+        raise ValueError("pages must be between 1 and 10")
+
+    await ctx.info(f"Connecting to Chrome debug endpoint: {debug_url}")
+    try:
+        result = await _extract_jobs_from_chrome_debug(
+            keyword=keyword,
+            city=city,
+            city_code=city_code,
+            days=days,
+            pages=pages,
+            extra_keywords=extra_keywords,
+            require_publish_date=require_publish_date,
+            debug_url=debug_url,
+            allow_navigation=allow_navigation,
+        )
+        return json.dumps(result, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        return json.dumps(
+            {
+                "status": "chrome_debug_unavailable",
+                "message": "Could not connect to Chrome DevTools. Close Chrome and start it with remote debugging enabled, then log in to Boss normally.",
+                "debug_url": debug_url,
+                "start_command": "open -na 'Google Chrome' --args --remote-debugging-port=9222 --user-data-dir=/tmp/boss-mcp-chrome-debug",
+                "error": str(exc),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
 
 
 def main() -> None:

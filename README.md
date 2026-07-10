@@ -5,6 +5,7 @@
 当前版本使用 **FastMCP + Playwright**。它不会硬编码 Boss 的内部接口，而是使用一个本地持久化浏览器资料目录复用登录态：
 
 - 优先调用 `import_boss_cookies(cookie_header="...")` 导入正常浏览器里的 Cookie。
+- 如果 Boss 对 Playwright profile 触发风控，可以用 `search_boss_jobs_chrome_debug()` 连接真实 Chrome 会话读取页面。
 - `start_boss_qr_login()` / `complete_boss_qr_login()` 是备用方案；Boss 可能会让 App 显示“扫码失败”。
 - `login_boss_interactive()` 仍可作为备用，但 Boss 可能会把浏览器登录页跳到 `about:blank`。
 - 再调用 `search_boss_jobs(keyword="AI解决方案岗", days=30)` 搜索最近 30 天匹配岗位。
@@ -136,12 +137,40 @@ python -m boss_mcp_job_hunting.server
 
 如果某些岗位卡片没有显示发布时间，可以把 `require_publish_date` 设为 `false`，这样会保留没有发布时间但关键词匹配的岗位。
 
+### `search_boss_jobs_chrome_debug`
+
+连接你真实的 Chrome 会话读取 Boss 页面。适合普通 MCP 浏览器 profile 被 Boss 风控拦截，但你自己的 Chrome 可以正常登录浏览时使用。
+
+先关闭 Chrome，然后启动一个带调试端口的独立 Chrome：
+
+```bash
+open -na 'Google Chrome' --args --remote-debugging-port=9222 --user-data-dir=/tmp/boss-mcp-chrome-debug
+```
+
+在这个 Chrome 里正常登录 Boss 直聘，手动打开目标搜索页并等结果渲染出来，然后调用：
+
+```json
+{
+  "keyword": "AI解决方案岗",
+  "city": "全国",
+  "days": 30,
+  "pages": 3,
+  "extra_keywords": ["大模型", "售前", "解决方案", "AI Solution"],
+  "require_publish_date": true,
+  "debug_url": "http://127.0.0.1:9222",
+  "allow_navigation": false
+}
+```
+
+这个工具只连接本机 Chrome DevTools，不会把 Cookie 写入 Git。默认 `allow_navigation=false`，只读取你已经打开的 Boss 标签页，不新开页面、不跳转 URL，避免 Boss 把页面变成 `about:blank`。
+
 ## 说明
 
 Boss 直聘页面和风控策略可能变化。如果搜索结果为空，通常先尝试：
 
 1. 调用 `import_boss_cookies` 导入正常浏览器的 Cookie。
 2. 如果 Cookie 失效，重新在正常浏览器里登录 Boss 直聘并复制新的 Cookie。
-3. 如果想尝试二维码备用方案，调用 `start_boss_qr_login()` 和 `complete_boss_qr_login()`。
-4. 把 `search_boss_jobs` 的 `headless` 改为 `false` 观察浏览器页面。
-5. 减少 `pages`，避免过于频繁访问。
+3. 如果 Playwright profile 仍触发风控，用 `search_boss_jobs_chrome_debug` 连接真实 Chrome。
+4. 如果想尝试二维码备用方案，调用 `start_boss_qr_login()` 和 `complete_boss_qr_login()`。
+5. 把 `search_boss_jobs` 的 `headless` 改为 `false` 观察浏览器页面。
+6. 减少 `pages`，避免过于频繁访问。
