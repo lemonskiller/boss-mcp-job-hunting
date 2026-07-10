@@ -49,7 +49,7 @@ python -m boss_mcp_job_hunting.server
 
 ### `login_boss_interactive`
 
-打开可见浏览器窗口，等待扫码登录和安全验证完成。默认会先给你 90 秒扫码时间，这段时间不会访问岗位搜索页，避免 Boss 在你扫码前就把页面跳到 `about:blank`。如果登录页变成 `about:blank`，工具会自动重开登录页。
+打开可见浏览器窗口，等待扫码登录和安全验证完成。默认会先给你 90 秒扫码时间，这段时间不会访问岗位搜索页，避免 Boss 在你扫码前就把页面跳到 `about:blank`。如果登录页变成 `about:blank`，工具会返回 `blank_redirect`，不会自动重开窗口；这时建议用 `import_boss_cookies`。
 
 ```json
 {

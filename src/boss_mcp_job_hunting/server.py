@@ -507,9 +507,10 @@ async def login_boss_interactive(
 ) -> str:
     """Open a visible Boss login window and wait until the session can open job search.
 
-    The tool first gives the user a quiet QR-login window. During that grace
-    period it does not probe the job-search URL, because Boss may redirect the
-    whole session to about:blank if the probe starts before the user scans.
+    The tool first gives the user a quiet QR-login window. It never opens a
+    replacement window after Boss redirects the page to about:blank, because that
+    makes QR login unusable; instead it returns a clear status so the caller can
+    fall back to cookie import.
     """
 
     if timeout_seconds < 30 or timeout_seconds > 900:
@@ -532,9 +533,32 @@ async def login_boss_interactive(
         last_status: dict[str, Any] | None = None
 
         while loop.time() < deadline:
-            if page.is_closed() or _looks_blank(page.url):
-                page = await context.new_page()
-                await _goto(page, BOSS_LOGIN_URL)
+            if page.is_closed():
+                return json.dumps(
+                    {
+                        "status": "browser_closed",
+                        "message": "The Boss login window was closed before login completed.",
+                        "applied_env_cookies": applied_env_cookies,
+                        "profile_dir": _profile_display(),
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            if _looks_blank(page.url):
+                cookies = await context.cookies("https://www.zhipin.com")
+                cookie_names = sorted(cookie["name"] for cookie in cookies)
+                return json.dumps(
+                    {
+                        "status": "blank_redirect",
+                        "message": "Boss redirected the login window to about:blank before a login cookie was detected. The tool will not reopen windows automatically. Use import_boss_cookies with cookies copied from a normal browser session.",
+                        "applied_env_cookies": applied_env_cookies,
+                        "profile_dir": _profile_display(),
+                        "cookie_names": cookie_names,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
 
             cookies = await context.cookies("https://www.zhipin.com")
             cookie_names = sorted(cookie["name"] for cookie in cookies)
