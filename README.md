@@ -37,7 +37,7 @@ python -m boss_mcp_job_hunting.server
 {
   "mcpServers": {
     "boss-mcp-job-hunting": {
-      "command": "/absolute/path/to/boss-mcp-job-hunting/.venv/bin/boss-mcp-job-hunting",
+      "command": "boss-mcp-job-hunting",
       "args": []
     }
   }
