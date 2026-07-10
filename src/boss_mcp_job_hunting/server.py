@@ -9,15 +9,21 @@ searches can reuse the same local browser profile.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import os
 import re
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote_plus
 
+import requests
+from Crypto.Cipher import AES
+from Crypto.Random import get_random_bytes
+from Crypto.Util.Padding import pad
 from fastmcp import Context, FastMCP
 from playwright.async_api import BrowserContext, Page, async_playwright
 
@@ -26,10 +32,18 @@ mcp = FastMCP("boss-mcp-job-hunting")
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_PROFILE_DIR = PROJECT_ROOT / ".boss-browser-profile"
+QR_DIR = PROJECT_ROOT / ".boss-qrcode"
 BOSS_HOME_URL = "https://www.zhipin.com/"
-BOSS_LOGIN_URL = "https://www.zhipin.com/web/user/?ka=header-login"
+BOSS_LOGIN_URL = "https://www.zhipin.com/web/user/"
 BOSS_JOB_SEARCH_URL = "https://www.zhipin.com/web/geek/job"
 BOSS_COOKIE_ENV = "BOSS_COOKIE"
+DISPATCHER_I_STR = (
+    "8048b8676fb7d3d8952276e6e98e0bde."
+    "f2dc7a63c4b0fbfa4b51a07e2710cf83."
+    "fef7e750fc3a1e6327e8a880915aee9c."
+    "ae00f848beb1aa591d71d5a80dd3bd95"
+)
+DISPATCHER_E_B64 = "clRwXUJBK1VKK0k0IWFbbQ=="
 
 CITY_CODE_MAP = {
     "全国": "100010000",
@@ -64,6 +78,17 @@ class JobPosting:
     raw_text: str | None = None
 
 
+@dataclass
+class QrLoginState:
+    qr_id: str | None = None
+    qr_path: str | None = None
+    created_at: float | None = None
+    session: requests.Session | None = None
+
+
+qr_login_state = QrLoginState()
+
+
 def _profile_dir() -> Path:
     configured = os.getenv("BOSS_MCP_PROFILE_DIR")
     return Path(configured).expanduser() if configured else DEFAULT_PROFILE_DIR
@@ -71,6 +96,13 @@ def _profile_dir() -> Path:
 
 def _profile_display() -> str:
     return "<BOSS_MCP_PROFILE_DIR>" if os.getenv("BOSS_MCP_PROFILE_DIR") else "./.boss-browser-profile"
+
+
+def _qr_display(path: Path) -> str:
+    try:
+        return str(path.relative_to(PROJECT_ROOT))
+    except ValueError:
+        return str(path)
 
 
 def _city_code(city: str, city_code: str | None = None) -> str:
@@ -114,6 +146,148 @@ def _cookie_header_to_playwright_cookies(cookie_header: str) -> list[dict[str, s
             }
         )
     return cookies
+
+
+def _requests_cookie_header(session: requests.Session) -> str:
+    return "; ".join(f"{cookie.name}={cookie.value}" for cookie in session.cookies)
+
+
+def _make_requests_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Referer": BOSS_LOGIN_URL,
+            "Origin": "https://www.zhipin.com",
+        }
+    )
+    return session
+
+
+def _dispatcher_fp() -> str:
+    key_bytes = base64.b64decode(DISPATCHER_E_B64)
+    plaintext_bytes = DISPATCHER_I_STR.encode("utf-8")
+    iv_bytes = get_random_bytes(16)
+    cipher = AES.new(key_bytes, AES.MODE_CBC, iv_bytes)
+    ciphertext_bytes = cipher.encrypt(pad(plaintext_bytes, AES.block_size))
+    return base64.b64encode(iv_bytes + ciphertext_bytes).decode("utf-8")
+
+
+def _save_qr_image(qr_id: str, image_bytes: bytes, content_type: str = "") -> Path:
+    QR_DIR.mkdir(parents=True, exist_ok=True)
+    is_jpeg = image_bytes.startswith(b"\xff\xd8") or "jpeg" in content_type.lower() or "jpg" in content_type.lower()
+    suffix = ".jpg" if is_jpeg else ".png"
+    path = QR_DIR / f"boss_qr_{qr_id}{suffix}"
+    path.write_bytes(image_bytes)
+    return path
+
+
+def _qr_session_path(qr_id: str) -> Path:
+    return QR_DIR / f"{qr_id}.session.json"
+
+
+def _save_qr_session(qr_id: str, session: requests.Session) -> None:
+    QR_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "qr_id": qr_id,
+        "created_at": time.time(),
+        "cookies": requests.utils.dict_from_cookiejar(session.cookies),
+    }
+    _qr_session_path(qr_id).write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _load_qr_session(qr_id: str) -> requests.Session:
+    session = _make_requests_session()
+    path = _qr_session_path(qr_id)
+    if path.exists():
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        session.cookies.update(requests.utils.cookiejar_from_dict(payload.get("cookies", {})))
+    return session
+
+
+def _start_qr_login_sync() -> dict[str, Any]:
+    session = _make_requests_session()
+    randkey_resp = session.post("https://www.zhipin.com/wapi/zppassport/captcha/randkey", timeout=15)
+    randkey_resp.raise_for_status()
+    qr_id = randkey_resp.json()["zpData"]["qrId"]
+
+    image_resp = session.get(
+        f"https://www.zhipin.com/wapi/zpweixin/qrcode/getqrcode?content={qr_id}",
+        timeout=15,
+    )
+    image_resp.raise_for_status()
+    qr_path = _save_qr_image(qr_id, image_resp.content, image_resp.headers.get("Content-Type", ""))
+
+    qr_login_state.qr_id = qr_id
+    qr_login_state.qr_path = str(qr_path)
+    qr_login_state.created_at = time.time()
+    qr_login_state.session = session
+    _save_qr_session(qr_id, session)
+
+    return {
+        "qr_id": qr_id,
+        "qr_path": str(qr_path),
+        "qr_display": _qr_display(qr_path),
+        "cookie_names": sorted(cookie.name for cookie in session.cookies),
+    }
+
+
+def _complete_qr_login_sync(qr_id: str, timeout_seconds: int) -> dict[str, Any]:
+    session = qr_login_state.session if qr_login_state.qr_id == qr_id else None
+    session = session or _load_qr_session(qr_id)
+    deadline = time.time() + timeout_seconds
+    scanned = False
+
+    while time.time() < deadline:
+        if not scanned:
+            scan_resp = session.get(
+                f"https://www.zhipin.com/wapi/zppassport/qrcode/scan?uuid={qr_id}",
+                timeout=35,
+            )
+            if scan_resp.status_code == 200:
+                payload = scan_resp.json()
+                scanned = bool(payload.get("scaned"))
+                if not scanned and payload.get("msg") != "timeout":
+                    time.sleep(1)
+            continue
+
+        confirm_resp = session.get(
+            f"https://www.zhipin.com/wapi/zppassport/qrcode/scanLogin?qrId={qr_id}&status=1",
+            timeout=35,
+        )
+        if confirm_resp.status_code == 200:
+            dispatcher_resp = session.get(
+                "https://www.zhipin.com/wapi/zppassport/qrcode/dispatcher",
+                params={"qrId": qr_id, "pk": "header-login", "fp": _dispatcher_fp()},
+                allow_redirects=False,
+                timeout=20,
+            )
+            dispatcher_resp.raise_for_status()
+            cookie_header = _requests_cookie_header(session)
+            return {
+                "status": "confirmed",
+                "qr_id": qr_id,
+                "cookie_header": cookie_header,
+                "cookie_names": _safe_cookie_names(cookie_header),
+            }
+
+        try:
+            payload = confirm_resp.json()
+        except Exception:
+            payload = {}
+        if payload.get("msg") != "timeout":
+            time.sleep(1)
+
+    return {
+        "status": "timeout",
+        "qr_id": qr_id,
+        "scanned": scanned,
+        "cookie_names": sorted(cookie.name for cookie in session.cookies),
+    }
 
 
 def _keyword_terms(keyword: str, extra_keywords: list[str] | None) -> list[str]:
@@ -450,28 +624,44 @@ async def _click_next_page(page: Page) -> bool:
 
 
 @mcp.tool()
-async def open_boss_login(ctx: Context, headless: bool = False) -> str:
+async def open_boss_login(
+    ctx: Context,
+    headless: bool = False,
+    wait_seconds: int = 180,
+) -> str:
     """Open Boss Zhipin login page with the persistent browser profile.
 
     Keep the opened browser window until you finish scanning the QR code. The
     profile is stored locally and reused by search tools.
     """
 
+    if wait_seconds < 0 or wait_seconds > 900:
+        raise ValueError("wait_seconds must be between 0 and 900")
+
     await ctx.info("Opening Boss Zhipin login page...")
     context = await _launch_context(headless=headless)
-    page = await context.new_page()
-    await _goto(page, BOSS_LOGIN_URL)
-
-    return json.dumps(
-        {
-            "status": "opened",
-            "message": "Boss login page opened. Prefer login_boss_interactive for a guided login flow.",
-            "profile_dir": _profile_display(),
-            "url": page.url,
-        },
-        ensure_ascii=False,
-        indent=2,
-    )
+    try:
+        page = await context.new_page()
+        await _goto(page, BOSS_LOGIN_URL)
+        await ctx.info(f"Boss login page opened at {page.url}; keeping browser open for {wait_seconds}s")
+        if wait_seconds:
+            await page.wait_for_timeout(wait_seconds * 1000)
+        cookies = await context.cookies("https://www.zhipin.com")
+        cookie_names = sorted(cookie["name"] for cookie in cookies)
+        return json.dumps(
+            {
+                "status": "opened",
+                "message": "Boss login page was opened and held for manual QR scan.",
+                "profile_dir": _profile_display(),
+                "url": page.url,
+                "cookie_names": cookie_names,
+                "has_login_cookie": _has_login_cookie(cookie_names),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    finally:
+        await _close_context(context)
 
 
 @mcp.tool()
@@ -490,6 +680,91 @@ async def get_boss_login_status(ctx: Context, headless: bool = True) -> str:
                 "applied_env_cookies": applied_env_cookies,
                 "profile_dir": _profile_display(),
                 "current_url": status["current_url"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    finally:
+        await _close_context(context)
+
+
+@mcp.tool()
+async def start_boss_qr_login(ctx: Context) -> str:
+    """Generate a Boss Zhipin QR login image without opening a browser page.
+
+    This is the preferred login start method when browser-based login is
+    immediately redirected to about:blank. Scan the returned PNG with the Boss
+    app, then call complete_boss_qr_login.
+    """
+
+    await ctx.info("Generating Boss QR login image...")
+    try:
+        result = await asyncio.to_thread(_start_qr_login_sync)
+        return json.dumps(
+            {
+                "status": "qr_generated",
+                "message": "Scan the QR image with the Boss app, then call complete_boss_qr_login.",
+                "qr_id": result["qr_id"],
+                "qr_image_path": result["qr_display"],
+                "cookie_names": result["cookie_names"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    except Exception as exc:
+        await ctx.error(f"Failed to generate Boss QR login image: {exc}")
+        return json.dumps(
+            {
+                "status": "error",
+                "message": str(exc),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+
+@mcp.tool()
+async def complete_boss_qr_login(
+    ctx: Context,
+    qr_id: str | None = None,
+    timeout_seconds: int = 180,
+    verify: bool = True,
+) -> str:
+    """Wait for Boss QR scan confirmation and import the resulting cookies."""
+
+    if timeout_seconds < 30 or timeout_seconds > 600:
+        raise ValueError("timeout_seconds must be between 30 and 600")
+
+    qr_id = qr_id or qr_login_state.qr_id
+    if not qr_id:
+        return json.dumps(
+            {
+                "status": "missing_qr",
+                "message": "Call start_boss_qr_login first, or pass qr_id explicitly.",
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+
+    await ctx.info("Waiting for Boss QR scan confirmation...")
+    result = await asyncio.to_thread(_complete_qr_login_sync, qr_id, timeout_seconds)
+    if result["status"] != "confirmed":
+        return json.dumps(result, ensure_ascii=False, indent=2)
+
+    cookie_header = result.get("cookie_header", "")
+    context = await _launch_context(headless=True)
+    try:
+        imported = await _apply_cookie_header(context, cookie_header)
+        verification = await _probe_login_status(context) if verify else None
+        return json.dumps(
+            {
+                "status": "success" if not verification or verification["likely_logged_in"] else "confirmed_but_not_verified",
+                "message": "QR login confirmed and cookies imported.",
+                "qr_id": qr_id,
+                "imported_cookie_count": imported,
+                "imported_cookie_names": result["cookie_names"],
+                "profile_dir": _profile_display(),
+                "verification": verification,
             },
             ensure_ascii=False,
             indent=2,

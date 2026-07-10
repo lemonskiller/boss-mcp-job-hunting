@@ -4,8 +4,9 @@
 
 当前版本使用 **FastMCP + Playwright**。它不会硬编码 Boss 的内部接口，而是使用一个本地持久化浏览器资料目录复用登录态：
 
-- 先调用 `login_boss_interactive()`，在浏览器里扫码登录 Boss 直聘。
-- 如果 Boss 安全验证后没有形成完整登录态，可以调用 `import_boss_cookies(cookie_header="...")` 导入正常浏览器里的 Cookie。
+- 优先调用 `import_boss_cookies(cookie_header="...")` 导入正常浏览器里的 Cookie。
+- `start_boss_qr_login()` / `complete_boss_qr_login()` 是备用方案；Boss 可能会让 App 显示“扫码失败”。
+- `login_boss_interactive()` 仍可作为备用，但 Boss 可能会把浏览器登录页跳到 `about:blank`。
 - 再调用 `search_boss_jobs(keyword="AI解决方案岗", days=30)` 搜索最近 30 天匹配岗位。
 
 ## 安装
@@ -47,15 +48,37 @@ python -m boss_mcp_job_hunting.server
 
 ## 工具
 
-### `login_boss_interactive`
+### `import_boss_cookies`
 
-打开可见浏览器窗口，等待扫码登录和安全验证完成。默认会先给你 90 秒扫码时间，这段时间不会访问岗位搜索页，避免 Boss 在你扫码前就把页面跳到 `about:blank`。如果登录页变成 `about:blank`，工具会返回 `blank_redirect`，不会自动重开窗口；这时建议用 `import_boss_cookies`。
+把已经登录 Boss 直聘的浏览器 Cookie 导入到 MCP 的持久化资料目录。这是当前最稳的登录方式。
 
 ```json
 {
-  "timeout_seconds": 300,
-  "qr_wait_seconds": 90,
-  "check_interval_seconds": 5
+  "cookie_header": "复制浏览器请求头里的 Cookie 内容",
+  "verify": true
+}
+```
+
+也可以在 MCP 启动环境里设置 `BOSS_COOKIE`，搜索时会自动应用。
+
+### `start_boss_qr_login`
+
+生成 Boss 直聘登录二维码图片，不打开浏览器登录页。这个接口可能被 Boss App 判定为“扫码失败”，因此只作为备用方案。
+
+```json
+{}
+```
+
+返回里的 `qr_image_path` 是本地二维码图片路径。用 Boss 直聘 App 扫码后，继续调用 `complete_boss_qr_login`。
+
+### `complete_boss_qr_login`
+
+等待 App 扫码确认，并把拿到的登录 Cookie 导入 MCP 的持久化资料目录。
+
+```json
+{
+  "timeout_seconds": 180,
+  "verify": true
 }
 ```
 
@@ -75,18 +98,17 @@ python -m boss_mcp_job_hunting.server
 }
 ```
 
-### `import_boss_cookies`
+### `login_boss_interactive`
 
-把已经登录 Boss 直聘的浏览器 Cookie 导入到 MCP 的持久化资料目录。适合页面扫码登录被风控打断时使用。
+打开可见浏览器窗口，等待扫码登录和安全验证完成。默认会先给你 90 秒扫码时间，这段时间不会访问岗位搜索页，避免 Boss 在你扫码前就把页面跳到 `about:blank`。如果登录页变成 `about:blank`，工具会返回 `blank_redirect`，不会自动重开窗口；这时建议用 `import_boss_cookies`。
 
 ```json
 {
-  "cookie_header": "复制浏览器请求头里的 Cookie 内容",
-  "verify": true
+  "timeout_seconds": 300,
+  "qr_wait_seconds": 90,
+  "check_interval_seconds": 5
 }
 ```
-
-也可以在 MCP 启动环境里设置 `BOSS_COOKIE`，搜索时会自动应用。
 
 ### `get_boss_login_status`
 
@@ -118,7 +140,8 @@ python -m boss_mcp_job_hunting.server
 
 Boss 直聘页面和风控策略可能变化。如果搜索结果为空，通常先尝试：
 
-1. 调用 `login_boss_interactive()` 完成登录或安全验证。
-2. 如果仍被重定向到登录页，调用 `import_boss_cookies` 导入正常浏览器的 Cookie。
-3. 把 `search_boss_jobs` 的 `headless` 改为 `false` 观察浏览器页面。
-4. 减少 `pages`，避免过于频繁访问。
+1. 调用 `import_boss_cookies` 导入正常浏览器的 Cookie。
+2. 如果 Cookie 失效，重新在正常浏览器里登录 Boss 直聘并复制新的 Cookie。
+3. 如果想尝试二维码备用方案，调用 `start_boss_qr_login()` 和 `complete_boss_qr_login()`。
+4. 把 `search_boss_jobs` 的 `headless` 改为 `false` 观察浏览器页面。
+5. 减少 `pages`，避免过于频繁访问。
