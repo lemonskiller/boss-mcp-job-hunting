@@ -29,6 +29,7 @@ DEFAULT_PROFILE_DIR = PROJECT_ROOT / ".boss-browser-profile"
 BOSS_HOME_URL = "https://www.zhipin.com/"
 BOSS_LOGIN_URL = "https://www.zhipin.com/web/user/?ka=header-login"
 BOSS_JOB_SEARCH_URL = "https://www.zhipin.com/web/geek/job"
+BOSS_COOKIE_ENV = "BOSS_COOKIE"
 
 CITY_CODE_MAP = {
     "全国": "100010000",
@@ -68,6 +69,10 @@ def _profile_dir() -> Path:
     return Path(configured).expanduser() if configured else DEFAULT_PROFILE_DIR
 
 
+def _profile_display() -> str:
+    return "<BOSS_MCP_PROFILE_DIR>" if os.getenv("BOSS_MCP_PROFILE_DIR") else "./.boss-browser-profile"
+
+
 def _city_code(city: str, city_code: str | None = None) -> str:
     if city_code:
         return city_code
@@ -77,6 +82,38 @@ def _city_code(city: str, city_code: str | None = None) -> str:
 def _build_search_url(keyword: str, city: str, city_code: str | None = None) -> str:
     code = _city_code(city, city_code)
     return f"{BOSS_JOB_SEARCH_URL}?query={quote_plus(keyword)}&city={quote_plus(code)}"
+
+
+def _safe_cookie_names(cookie_header: str) -> list[str]:
+    names = []
+    for part in cookie_header.split(";"):
+        if "=" not in part:
+            continue
+        name = part.split("=", 1)[0].strip()
+        if name:
+            names.append(name)
+    return sorted(set(names))
+
+
+def _cookie_header_to_playwright_cookies(cookie_header: str) -> list[dict[str, str]]:
+    cookies = []
+    for part in cookie_header.split(";"):
+        if "=" not in part:
+            continue
+        name, value = part.split("=", 1)
+        name = name.strip()
+        value = value.strip()
+        if not name:
+            continue
+        cookies.append(
+            {
+                "name": name,
+                "value": value,
+                "domain": ".zhipin.com",
+                "path": "/",
+            }
+        )
+    return cookies
 
 
 def _keyword_terms(keyword: str, extra_keywords: list[str] | None) -> list[str]:
@@ -196,7 +233,81 @@ async def _goto(page: Page, url: str) -> None:
 
 
 def _looks_like_login_page(url: str) -> bool:
-    return "/web/user/" in url or "passport" in url or "login" in url
+    return (
+        _looks_blank(url)
+        or "/web/user/" in url
+        or "passport" in url
+        or "login" in url
+        or "security-check" in url
+        or "verify.html" in url
+    )
+
+
+def _looks_blank(url: str) -> bool:
+    return url == "about:blank" or not url
+
+
+# Cookies Boss only issues to an authenticated geek (job-seeker) session. The
+# anonymous profile carries tracking cookies (__zp_stoken__, __g, __l, ...) but
+# none of these login tokens.
+BOSS_LOGIN_COOKIE_MARKERS = {"geek_zp_token", "bst", "wt2", "t"}
+
+
+def _has_login_cookie(cookie_names: list[str]) -> bool:
+    return any(name in BOSS_LOGIN_COOKIE_MARKERS for name in cookie_names)
+
+
+def _on_job_search_page(url: str) -> bool:
+    return "/web/geek/job" in url and not _looks_like_login_page(url)
+
+
+async def _apply_cookie_header(context: BrowserContext, cookie_header: str) -> int:
+    cookies = _cookie_header_to_playwright_cookies(cookie_header)
+    if cookies:
+        await context.add_cookies(cookies)
+    return len(cookies)
+
+
+async def _apply_env_cookies(context: BrowserContext) -> int:
+    cookie_header = os.getenv(BOSS_COOKIE_ENV, "").strip()
+    if not cookie_header:
+        return 0
+    return await _apply_cookie_header(context, cookie_header)
+
+
+async def _probe_login_status(context: BrowserContext) -> dict[str, Any]:
+    """Positively confirm a logged-in Boss session.
+
+    Boss may bounce the job-search URL to ``about:blank`` during a security
+    check, so we retry the navigation a couple of times. Login is only reported
+    when the page actually settles on the job-search URL AND the context holds a
+    known login-token cookie. Landing on ``about:blank`` or the login page counts
+    as *not* logged in rather than being inferred as success.
+    """
+
+    page = await context.new_page()
+    try:
+        current_url = ""
+        for _ in range(3):
+            await _goto(page, BOSS_JOB_SEARCH_URL)
+            current_url = page.url
+            if not _looks_blank(current_url):
+                break
+            await page.wait_for_timeout(1500)
+
+        cookies = await context.cookies("https://www.zhipin.com")
+        cookie_names = sorted(cookie["name"] for cookie in cookies)
+        has_login_cookie = _has_login_cookie(cookie_names)
+        on_search_page = _on_job_search_page(current_url)
+        return {
+            "likely_logged_in": on_search_page and has_login_cookie,
+            "on_job_search_page": on_search_page,
+            "has_login_cookie": has_login_cookie,
+            "cookie_names": cookie_names,
+            "current_url": current_url,
+        }
+    finally:
+        await page.close()
 
 
 async def _scroll_job_list(page: Page) -> None:
@@ -332,8 +443,8 @@ async def open_boss_login(ctx: Context, headless: bool = False) -> str:
     return json.dumps(
         {
             "status": "opened",
-            "message": "Boss login page opened. Scan the QR code in the browser window if needed.",
-            "profile_dir": str(_profile_dir()),
+            "message": "Boss login page opened. Prefer login_boss_interactive for a guided login flow.",
+            "profile_dir": _profile_display(),
             "url": page.url,
         },
         ensure_ascii=False,
@@ -348,17 +459,120 @@ async def get_boss_login_status(ctx: Context, headless: bool = True) -> str:
     await ctx.info("Checking Boss login status...")
     context = await _launch_context(headless=headless)
     try:
-        page = await context.new_page()
-        await _goto(page, BOSS_JOB_SEARCH_URL)
-        cookies = await context.cookies("https://www.zhipin.com")
-        cookie_names = sorted(cookie["name"] for cookie in cookies)
-        likely_logged_in = not _looks_like_login_page(page.url)
+        applied_env_cookies = await _apply_env_cookies(context)
+        status = await _probe_login_status(context)
         return json.dumps(
             {
-                "likely_logged_in": likely_logged_in,
-                "cookie_names": cookie_names,
-                "profile_dir": str(_profile_dir()),
-                "current_url": page.url,
+                "likely_logged_in": status["likely_logged_in"],
+                "cookie_names": status["cookie_names"],
+                "applied_env_cookies": applied_env_cookies,
+                "profile_dir": _profile_display(),
+                "current_url": status["current_url"],
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    finally:
+        await _close_context(context)
+
+
+@mcp.tool()
+async def login_boss_interactive(
+    ctx: Context,
+    timeout_seconds: int = 300,
+    check_interval_seconds: int = 5,
+) -> str:
+    """Open a visible Boss login window and wait until the session can open job search.
+
+    Boss may redirect security-check pages to about:blank. This tool handles that
+    by reopening the login/search page in the same persistent profile and probing
+    whether the job-search page is accessible before returning.
+    """
+
+    if timeout_seconds < 30 or timeout_seconds > 900:
+        raise ValueError("timeout_seconds must be between 30 and 900")
+    if check_interval_seconds < 2 or check_interval_seconds > 30:
+        raise ValueError("check_interval_seconds must be between 2 and 30")
+
+    await ctx.info("Opening visible Boss login window...")
+    context = await _launch_context(headless=False)
+    try:
+        applied_env_cookies = await _apply_env_cookies(context)
+        page = await context.new_page()
+        await _goto(page, BOSS_LOGIN_URL)
+
+        deadline = asyncio.get_running_loop().time() + timeout_seconds
+        last_status: dict[str, Any] | None = None
+
+        while asyncio.get_running_loop().time() < deadline:
+            if page.is_closed() or _looks_blank(page.url):
+                page = await context.new_page()
+                await _goto(page, BOSS_JOB_SEARCH_URL)
+
+            if _looks_like_login_page(page.url):
+                await ctx.info("Waiting for Boss QR login or verification...")
+            else:
+                await ctx.info("Boss page is no longer on the login URL; probing job search...")
+
+            last_status = await _probe_login_status(context)
+            if last_status["likely_logged_in"]:
+                return json.dumps(
+                    {
+                        "status": "success",
+                        "message": "Boss login is ready. Job search is accessible.",
+                        "applied_env_cookies": applied_env_cookies,
+                        "profile_dir": _profile_display(),
+                        **last_status,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+
+            await page.wait_for_timeout(check_interval_seconds * 1000)
+
+        return json.dumps(
+            {
+                "status": "timeout",
+                "message": "Timed out before Boss job search became accessible. If browser login keeps failing, use import_boss_cookies with cookies copied from a normal browser session.",
+                "applied_env_cookies": applied_env_cookies,
+                "profile_dir": _profile_display(),
+                "last_status": last_status,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    finally:
+        await _close_context(context)
+
+
+@mcp.tool()
+async def import_boss_cookies(
+    ctx: Context,
+    cookie_header: str,
+    verify: bool = True,
+) -> str:
+    """Import a Boss Zhipin Cookie header into the persistent browser profile.
+
+    Copy the Cookie request header from a logged-in Boss Zhipin browser session
+    and pass it here. The cookie values are not echoed back in the response.
+    """
+
+    cookie_header = cookie_header.strip()
+    if not cookie_header:
+        raise ValueError("cookie_header cannot be empty")
+
+    await ctx.info("Importing Boss cookies into the persistent browser profile...")
+    context = await _launch_context(headless=True)
+    try:
+        imported = await _apply_cookie_header(context, cookie_header)
+        status = await _probe_login_status(context) if verify else None
+        return json.dumps(
+            {
+                "status": "success" if not status or status["likely_logged_in"] else "imported_but_not_verified",
+                "imported_cookie_count": imported,
+                "imported_cookie_names": _safe_cookie_names(cookie_header),
+                "profile_dir": _profile_display(),
+                "verification": status,
             },
             ensure_ascii=False,
             indent=2,
@@ -405,6 +619,7 @@ async def search_boss_jobs(
 
     context = await _launch_context(headless=headless)
     try:
+        applied_env_cookies = await _apply_env_cookies(context)
         page = await context.new_page()
         await _goto(page, search_url)
 
@@ -412,7 +627,8 @@ async def search_boss_jobs(
             return json.dumps(
                 {
                     "status": "login_required",
-                    "message": "Boss Zhipin redirected to the login page. Run open_boss_login(headless=false), finish QR login, then search again.",
+                    "message": "Boss Zhipin redirected to the login page. Run login_boss_interactive, import_boss_cookies, or set BOSS_COOKIE with a logged-in Cookie header.",
+                    "applied_env_cookies": applied_env_cookies,
                     "current_url": page.url,
                     "source_url": search_url,
                 },
